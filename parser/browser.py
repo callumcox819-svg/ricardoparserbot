@@ -120,6 +120,32 @@ class BrowserSession:
         self.goto(search_url)
         self.wait_for_search_results()
 
+    def fetch_seller_shop_stats(self, nickname: str) -> dict[str, Any] | None:
+        if not nickname or not self.browser:
+            return None
+
+        from parser.extract import extract_seller_stats_from_shop_html
+
+        self.switch_to_nojs_mode()
+        page: Page | None = None
+        try:
+            page = self._nojs_context.new_page()
+            page.set_default_timeout(45000)
+            url = f"https://www.ricardo.ch/{self.locale}/shop/{nickname}/offers"
+            page.goto(url, timeout=45000, wait_until="domcontentloaded")
+            html = page.content()
+            stats = extract_seller_stats_from_shop_html(html)
+            return stats or None
+        except Exception as exc:
+            logger.warning("Shop fetch failed for %s: %s", nickname, exc)
+            return None
+        finally:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+
     def fetch_listing_next_data(self, url: str) -> dict[str, Any] | None:
         if not self.browser or not self._js_context:
             raise RuntimeError("Browser session is not initialized")

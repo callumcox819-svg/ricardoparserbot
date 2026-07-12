@@ -115,6 +115,8 @@ def parse_iso_datetime(value: Any) -> datetime | None:
     if not value:
         return None
     text = str(value).strip()
+    if text.isdigit() and len(text) == 4:
+        return datetime(int(text), 1, 1, tzinfo=timezone.utc)
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:

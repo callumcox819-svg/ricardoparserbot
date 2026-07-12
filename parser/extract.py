@@ -10,6 +10,10 @@ from parser.formatter import deep_get, parse_iso_datetime, relative_time_ru
 LISTING_HREF_RE = re.compile(r"/[a-z]{2}/a/\d+/?", re.I)
 LISTING_PATH_RE = re.compile(r"/[a-z]{2}/a/\d+[^\"\\]*", re.I)
 
+SHOP_MEMBER_SINCE_RE = re.compile(r'memberSince\\":\\"(\d{4})\\"')
+SHOP_ARTICLES_SOLD_RE = re.compile(r'articlesSold\\":(\d+)')
+SHOP_ARTICLES_BOUGHT_RE = re.compile(r'articlesBought\\":(\d+)')
+
 SEARCH_SUMMARY_JS = """
 () => {
   const locale = LOCALE;
@@ -51,6 +55,30 @@ def extract_article(next_data: dict[str, Any] | None) -> dict[str, Any]:
         or page_props.get("offer")
         or {}
     )
+
+
+def extract_seller_stats_from_shop_html(html: str) -> dict[str, Any]:
+    if not html or "Ricardo Captcha" in html:
+        return {}
+
+    bought = SHOP_ARTICLES_BOUGHT_RE.search(html)
+    sold = SHOP_ARTICLES_SOLD_RE.search(html)
+    member = SHOP_MEMBER_SINCE_RE.search(html)
+    if not bought and not sold and not member:
+        return {}
+
+    stats: dict[str, Any] = {}
+    if bought:
+        value = int(bought.group(1))
+        stats["articlesBought"] = value
+        stats["purchasesCount"] = value
+    if sold:
+        value = int(sold.group(1))
+        stats["articlesSold"] = value
+        stats["salesCount"] = value
+    if member:
+        stats["memberSince"] = member.group(1)
+    return stats
 
 
 def extract_seller_stats_from_state(next_data: dict[str, Any] | None) -> dict[str, Any]:

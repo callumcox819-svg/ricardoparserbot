@@ -40,7 +40,7 @@ class ParserConfig:
     proxy_url: str | None = None
     cookies_path: str | None = None
     enrich_details: bool = True
-    visit_seller_profile: bool = False
+    visit_seller_profile: bool = True
     listing_delay_sec: float = 1.0
     session_refresh_every: int = 20
 
@@ -132,6 +132,9 @@ class RicardoParser:
                 item = self._build_item_from_payload(summary, {"next_data": next_data, "product": {}})
                 if not item:
                     raise RuntimeError("empty article")
+                if self.config.visit_seller_profile and item.item_person_name:
+                    shop_stats = self._get_shop_seller_stats(session, item.item_person_name)
+                    item = self._apply_seller_stats(item, shop_stats)
                 if item.item_person_name or item.ads_number or item.rating:
                     enriched += 1
             except Exception as exc:
@@ -158,6 +161,7 @@ class RicardoParser:
             "purchasesCount",
             "purchaseCount",
             "purchase_count",
+            "articlesBought",
             "boughtCount",
             default=item.ads_number_bought,
         )
@@ -166,6 +170,7 @@ class RicardoParser:
             "salesCount",
             "soldCount",
             "sales_count",
+            "articlesSold",
             "completedSales",
             default=item.ads_number_sold,
         )
@@ -272,6 +277,15 @@ class RicardoParser:
             person_link=str(self._seller_profile_url(seller, nickname, seller_id) or summary.person_link or ""),
             item_person_name=nickname,
         )
+
+    def _get_shop_seller_stats(self, session: BrowserSession, nickname: str) -> dict[str, Any]:
+        cache_key = f"shop:{nickname}"
+        if cache_key in self._seller_cache:
+            return self._seller_cache[cache_key]
+
+        stats = session.fetch_seller_shop_stats(nickname) or {}
+        self._seller_cache[cache_key] = stats
+        return stats
 
     def _seller_stats_from_data(
         self,
