@@ -6,7 +6,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
-
 from playwright.async_api import Browser, Page, async_playwright
 
 from parser.formatter import (
@@ -20,7 +19,27 @@ from parser.formatter import (
 from parser.models import VoidParserItem, VoidParserResult
 
 LISTING_HREF_RE = re.compile(r"/[a-z]{2}/a/\d+/?", re.I)
-INTERSTITIAL_TITLES = {"just a moment...", "loading...", "attention required!"}
+INTERSTITIAL_TITLES = {
+    "just a moment...",
+    "loading...",
+    "attention required!",
+    "ricardo captcha",
+}
+
+
+def parse_playwright_proxy(proxy_url: str | None) -> dict[str, str] | None:
+    if not proxy_url:
+        return None
+    parsed = urlparse(proxy_url.strip())
+    if not parsed.hostname or not parsed.port:
+        raise ValueError("PROXY_URL must look like http://user:pass@host:port")
+    scheme = parsed.scheme or "http"
+    proxy: dict[str, str] = {"server": f"{scheme}://{parsed.hostname}:{parsed.port}"}
+    if parsed.username:
+        proxy["username"] = parsed.username
+    if parsed.password:
+        proxy["password"] = parsed.password
+    return proxy
 
 
 @dataclass
@@ -86,7 +105,7 @@ class RicardoParser:
             ],
         }
         if self.config.proxy_url:
-            launch_kwargs["proxy"] = {"server": self.config.proxy_url}
+            launch_kwargs["proxy"] = parse_playwright_proxy(self.config.proxy_url)
         return await playwright.chromium.launch(**launch_kwargs)
 
     async def _create_context(self, browser: Browser):
@@ -100,13 +119,16 @@ class RicardoParser:
             viewport={"width": 1366, "height": 900},
         )
 
-    async def _goto_ready(self, page: Page, url: str, timeout_ms: int = 90000) -> None:
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        for _ in range(40):
+    async def _goto_ready(self, page: Page, url: str, timeout_ms: int = 120000) -> None:
+        await page.goto(url, wait_until="commit", timeout=timeout_ms)
+        for _ in range(60):
             title = (await page.title() or "").strip().lower()
-            if title and title not in INTERSTITIAL_TITLES:
+            body = await page.content()
+            if "__NEXT_DATA__" in body and title not in INTERSTITIAL_TITLES:
                 return
-            await asyncio.sleep(1.5)
+            if title and title not in INTERSTITIAL_TITLES and "/de/a/" in page.url:
+                return
+            await asyncio.sleep(2)
         raise RuntimeError(f"Не удалось пройти защиту сайта для {url}")
 
     async def _extract_next_data(self, page: Page) -> dict[str, Any]:
