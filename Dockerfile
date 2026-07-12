@@ -5,6 +5,7 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV HEADLESS=true
+ENV ENRICH_DETAILS=false
 ENV XDG_CACHE_HOME=/app/.cache
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

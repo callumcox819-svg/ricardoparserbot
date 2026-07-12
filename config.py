@@ -16,6 +16,7 @@ class Settings:
     locale: str
     data_dir: str
     cookies_path: str
+    enrich_details: bool
 
 
 def get_settings() -> Settings:
@@ -27,6 +28,7 @@ def get_settings() -> Settings:
     max_pages = int(os.getenv("MAX_PAGES", "5"))
     max_items = int(os.getenv("MAX_ITEMS", "100"))
     headless = os.getenv("HEADLESS", "true").lower() in {"1", "true", "yes", "on"}
+    enrich_details = os.getenv("ENRICH_DETAILS", "false").lower() in {"1", "true", "yes", "on"}
     locale = os.getenv("LOCALE", "de").strip() or "de"
     data_dir = os.getenv("DATA_DIR", "data").strip() or "data"
     cookies_path = os.getenv("COOKIES_PATH", os.path.join(data_dir, "ricardo_cookies.json"))
@@ -40,4 +42,5 @@ def get_settings() -> Settings:
         locale=locale,
         data_dir=data_dir,
         cookies_path=cookies_path,
+        enrich_details=enrich_details,
     )

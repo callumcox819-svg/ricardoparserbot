@@ -48,6 +48,7 @@ async def run_parse_job(user_id: int, bot: Bot, start_url: str) -> None:
             headless=cfg.headless,
             proxy_url=cfg.proxy_url,
             cookies_path=cfg.cookies_path,
+            enrich_details=cfg.enrich_details,
         )
     )
 
@@ -93,6 +94,8 @@ async def on_start(message: Message) -> None:
         "/results — отправить последний JSON\n\n"
         "Пример:\n"
         "/parse https://www.ricardo.ch/de/s/?q=laptop\n\n"
+        "По умолчанию JSON собирается из поиска (быстро и стабильно).\n"
+        "Для детальных карточек: Railway Variable `ENRICH_DETAILS=true`.\n\n"
         "Токен бота берётся из Railway Variable `BOT_TOKEN`."
     )
 

@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 from parser.browser import BrowserSession
-from parser.formatter import deep_get
+from parser.formatter import deep_get, parse_iso_datetime, relative_time_ru
 
 LISTING_HREF_RE = re.compile(r"/[a-z]{2}/a/\d+/?", re.I)
 LISTING_PATH_RE = re.compile(r"/[a-z]{2}/a/\d+[^\"\\]*", re.I)
@@ -124,13 +124,28 @@ def extract_search_summaries_from_next_data(
             return
         seen.add(normalized)
         seller = item.get("seller") if isinstance(item.get("seller"), dict) else {}
+        nickname = str(seller.get("nickname") or seller.get("name") or "")
+        person_link = ""
+        for key in ("shopUrl", "sellerUrl", "profileUrl", "url"):
+            value = seller.get(key)
+            if isinstance(value, str) and value.startswith("http"):
+                person_link = value
+                break
+        if not person_link and nickname:
+            person_link = f"{base_url}/shop/{nickname}/offers"
+
+        created_raw = item.get("creationDate") or item.get("creation_date") or item.get("createdAt")
+        created_date = relative_time_ru(parse_iso_datetime(created_raw)) if created_raw else ""
+
         summaries.append(
             {
                 "url": normalized,
                 "title": str(item.get("title") or item.get("name") or ""),
                 "price": item.get("price") or item.get("buyNowPrice") or item.get("buy_now_price"),
                 "image": item.get("image") or item.get("thumbnailUrl") or "",
-                "seller_name": str(seller.get("nickname") or seller.get("name") or ""),
+                "seller_name": nickname,
+                "person_link": person_link,
+                "created_date": created_date,
             }
         )
 

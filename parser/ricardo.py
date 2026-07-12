@@ -41,6 +41,7 @@ class ParserConfig:
     headless: bool = True
     proxy_url: str | None = None
     cookies_path: str | None = None
+    enrich_details: bool = False
 
 
 @dataclass
@@ -50,6 +51,8 @@ class SearchSummary:
     price: Any = None
     image: str = ""
     seller_name: str = ""
+    person_link: str = ""
+    created_date: str = ""
 
 
 class RicardoParser:
@@ -83,6 +86,13 @@ class RicardoParser:
             summaries = self._collect_listings(session, start_url, notify)
 
         notify(f"Найдено объявлений: {len(summaries)}")
+        if not self.config.enrich_details:
+            notify("Собираю JSON из результатов поиска (без детальных страниц)")
+            items = [self._item_from_summary(summary) for summary in summaries]
+            notify(f"Готово к сохранению: {len(items)} объявлений")
+            return VoidParserResult(items=items)
+
+        notify("Режим ENRICH_DETAILS: открываю карточки (медленнее, может падать)")
         items: list[VoidParserItem] = []
         session: BrowserSession | None = None
 
@@ -131,6 +141,8 @@ class RicardoParser:
             item_price=format_price(summary.price),
             item_link=summary.url,
             item_person_name=str(summary.seller_name or ""),
+            person_link=str(summary.person_link or ""),
+            created_date=str(summary.created_date or ""),
             parser_views=parser_views,
         )
 
@@ -197,11 +209,34 @@ class RicardoParser:
                             price=item.get("price"),
                             image=str(item.get("image") or ""),
                             seller_name=str(item.get("seller_name") or ""),
+                            person_link=str(item.get("person_link") or ""),
+                            created_date=str(item.get("created_date") or ""),
                         )
                     )
                 if not page_summaries:
                     for link in self._extract_listing_links(session):
                         page_summaries.append(SearchSummary(url=link))
+
+            if page_summaries:
+                next_data = extract_next_data(session)
+                extras = {
+                    item["url"]: item
+                    for item in extract_search_summaries_from_next_data(
+                        next_data,
+                        locale=self.config.locale,
+                        base_url=self.base_url,
+                    )
+                }
+                for summary in page_summaries:
+                    extra = extras.get(summary.url)
+                    if not extra:
+                        continue
+                    if not summary.seller_name:
+                        summary.seller_name = str(extra.get("seller_name") or "")
+                    if not summary.person_link:
+                        summary.person_link = str(extra.get("person_link") or "")
+                    if not summary.created_date:
+                        summary.created_date = str(extra.get("created_date") or "")
 
             if not page_summaries:
                 title = session.evaluate("() => document.title || ''") or ""
