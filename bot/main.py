@@ -94,8 +94,8 @@ async def on_start(message: Message) -> None:
         "/results — отправить последний JSON\n\n"
         "Пример:\n"
         "/parse https://www.ricardo.ch/de/s/?q=laptop\n\n"
-        "По умолчанию JSON собирается из поиска (быстро и стабильно).\n"
-        "Для детальных карточек: Railway Variable `ENRICH_DETAILS=true`.\n\n"
+        "По умолчанию бот открывает карточки и собирает имена продавцов.\n"
+        "Быстрый режим без карточек: Railway Variable `ENRICH_DETAILS=false`.\n\n"
         "Токен бота берётся из Railway Variable `BOT_TOKEN`."
     )
 

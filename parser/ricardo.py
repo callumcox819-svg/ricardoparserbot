@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing as mp
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable
 from urllib.parse import quote, urljoin, urlparse, urlunparse, parse_qsl, urlencode
 
 from parser.browser import BrowserSession
+from parser.detail_worker import parse_detail_batch
 from parser.extract import (
     LISTING_HREF_RE,
     SEARCH_SUMMARY_JS,
@@ -41,7 +43,10 @@ class ParserConfig:
     headless: bool = True
     proxy_url: str | None = None
     cookies_path: str | None = None
-    enrich_details: bool = False
+    enrich_details: bool = True
+    visit_seller_profile: bool = False
+    detail_batch_size: int = 8
+    detail_timeout_sec: int = 180
 
 
 @dataclass
@@ -92,45 +97,60 @@ class RicardoParser:
             notify(f"Готово к сохранению: {len(items)} объявлений")
             return VoidParserResult(items=items)
 
-        notify("Режим ENRICH_DETAILS: открываю карточки (медленнее, может падать)")
-        items: list[VoidParserItem] = []
-        session: BrowserSession | None = None
-
-        def ensure_session() -> BrowserSession:
-            nonlocal session
-            if session is None or not session.is_alive():
-                if session is not None:
-                    try:
-                        session.__exit__(None, None, None)
-                    except Exception:
-                        pass
-                session = self._session()
-                session.__enter__()
-            return session
-
-        try:
-            for index, summary in enumerate(summaries, start=1):
-                notify(f"Парсинг {index}/{len(summaries)}")
-                item: VoidParserItem | None = None
-                try:
-                    item = self._parse_listing(ensure_session(), summary)
-                except Exception as exc:
-                    logger.warning("Listing parse failed for %s: %s", summary.url, exc)
-                    notify(f"Детали недоступны ({index}), беру из поиска")
-                    if session and not session.is_alive():
-                        session = None
-                if item is None:
-                    item = self._item_from_summary(summary)
-                items.append(item)
-                time.sleep(0.6)
-        finally:
-            if session is not None:
-                try:
-                    session.__exit__(None, None, None)
-                except Exception:
-                    pass
-
+        notify("Открываю карточки для имён продавцов и статистики...")
+        items = self._enrich_summaries_in_batches(summaries, notify)
         return VoidParserResult(items=items)
+
+    def _enrich_summaries_in_batches(
+        self,
+        summaries: list[SearchSummary],
+        notify: Callable[[str], None],
+    ) -> list[VoidParserItem]:
+        items: list[VoidParserItem | None] = [None] * len(summaries)
+        config_dict = asdict(self.config)
+        index = 0
+
+        while index < len(summaries):
+            end = min(index + self.config.detail_batch_size, len(summaries))
+            notify(f"Парсинг {index + 1}-{end}/{len(summaries)}")
+            batch = [asdict(summary) for summary in summaries[index:end]]
+            results = self._run_detail_batch(batch, config_dict, index)
+
+            if not results:
+                for pos in range(index, end):
+                    items[pos] = self._item_from_summary(summaries[pos])
+                index = end
+                continue
+
+            last_index = index
+            for global_index, item_dict in results:
+                if item_dict:
+                    items[global_index] = VoidParserItem(**item_dict)
+                else:
+                    items[global_index] = self._item_from_summary(summaries[global_index])
+                last_index = max(last_index, global_index + 1)
+
+            index = last_index if last_index > index else end
+
+        return [item if item is not None else self._item_from_summary(summaries[i]) for i, item in enumerate(items)]
+
+    def _run_detail_batch(
+        self,
+        batch: list[dict[str, Any]],
+        config_dict: dict[str, Any],
+        start_index: int,
+    ) -> list[tuple[int, dict[str, Any] | None]]:
+        ctx = mp.get_context("spawn")
+        pool = ctx.Pool(1)
+        try:
+            async_result = pool.apply_async(parse_detail_batch, (batch, config_dict, start_index))
+            return async_result.get(timeout=self.config.detail_timeout_sec)
+        except Exception as exc:
+            logger.warning("Detail batch failed at %s: %s", start_index, exc)
+            return []
+        finally:
+            pool.terminate()
+            pool.join()
 
     def _item_from_summary(self, summary: SearchSummary) -> VoidParserItem:
         parser_views = self._view_counts.get(summary.url, 0)
@@ -187,12 +207,17 @@ class RicardoParser:
                     full = urljoin(self.base_url + "/", href)
                     if not full.endswith("/"):
                         full += "/"
+                    person_link = str(item.get("person_link") or "")
+                    if person_link and not person_link.startswith("http"):
+                        person_link = urljoin(self.base_url + "/", person_link)
                     page_summaries.append(
                         SearchSummary(
                             url=full,
                             title=str(item.get("title") or ""),
                             price=item.get("price"),
                             image=str(item.get("image") or ""),
+                            seller_name=str(item.get("seller_name") or ""),
+                            person_link=person_link,
                         )
                     )
             else:
@@ -362,7 +387,7 @@ class RicardoParser:
             item_desc="",
             location="",
             item_link=listing_url,
-            person_link="",
+            person_link=str(self._seller_profile_url(seller, nickname, seller_id) or summary.person_link or ""),
             item_person_name=nickname,
         )
 
@@ -391,8 +416,10 @@ class RicardoParser:
         }
 
         seller_url = self._seller_profile_url(seller, nickname, seller_id)
-        needs_profile = seller_url and (
-            not stats["ads_number_bought"] or not stats["ads_number_sold"] or not stats["registration_date"]
+        needs_profile = (
+            self.config.visit_seller_profile
+            and seller_url
+            and (not stats["ads_number_bought"] or not stats["ads_number_sold"] or not stats["registration_date"])
         )
         if needs_profile and session.is_alive():
             try:

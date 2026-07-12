@@ -16,10 +16,13 @@ SEARCH_SUMMARY_JS = """
   const container = document.querySelector('[data-testid="regular-results"]');
   if (!container) return [];
   const cards = Array.from(container.querySelectorAll('a[href^="/' + locale + '/a/"]'));
-  return cards.map(card => {
+    return cards.map(card => {
     const href = card.getAttribute('href');
     const idMatch = href.match(/-(\\d+)\\/?$/);
     const img = card.querySelector('img[fetchpriority="high"]') || card.querySelector('img');
+    const root = card.closest('article') || card.parentElement;
+    const shopLink = root ? root.querySelector('a[href*="/shop/"]') : null;
+    const sellerName = shopLink ? (shopLink.textContent || '').trim() : '';
     const prices = Array.from(card.querySelectorAll('span'))
       .map(s => s.textContent.trim())
       .filter(t => /^\\d+[.,]?\\d*$/.test(t))
@@ -30,6 +33,8 @@ SEARCH_SUMMARY_JS = """
       url: href,
       price: prices.length ? prices[prices.length - 1] : null,
       image: img ? img.getAttribute('src') : null,
+      seller_name: sellerName,
+      person_link: shopLink ? shopLink.getAttribute('href') : null,
     };
   });
 }
