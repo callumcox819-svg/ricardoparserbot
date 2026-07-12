@@ -105,7 +105,13 @@ class RicardoParser:
         for page_num in range(1, self.config.max_pages + 1):
             page_url = self._with_page(normalized, page_num)
             notify(f"Страница поиска {page_num}: {page_url}")
-            session.goto(page_url)
+            try:
+                session.goto(page_url)
+            except Exception as exc:
+                notify(f"Ошибка загрузки страницы: {exc}")
+                break
+
+            notify("Жду результаты поиска...")
             if not session.wait_for_search_results():
                 title = session.evaluate("() => document.title || ''") or ""
                 current_url = session.page.url if session.page else page_url

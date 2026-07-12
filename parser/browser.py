@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any
 
@@ -10,6 +11,8 @@ from playwright.sync_api import Page
 
 from parser.proxy import parse_playwright_proxy
 from pin_camoufox_browser import ensure_pinned_browser
+
+logger = logging.getLogger(__name__)
 
 INTERSTITIAL_PREFIXES = (
     "loading",
@@ -53,8 +56,18 @@ class BrowserSession:
         self._camoufox = Camoufox(**launch_kwargs)
         self.browser = self._camoufox.__enter__()
         self.page = self.browser.new_page()
+        self.page.set_default_timeout(45000)
+        self.page.on("pageerror", self._on_page_error)
+        self.page.on("crash", self._on_page_crash)
         self._load_cookies()
         return self
+
+    def _on_page_error(self, error: BaseException) -> None:
+        # Ricardo sometimes throws JS errors; Playwright can crash while reporting them.
+        logger.warning("Page JS error (ignored): %s", error)
+
+    def _on_page_crash(self, _page: Page) -> None:
+        logger.error("Browser page crashed")
 
     def __exit__(self, *exc_info: object) -> None:
         self._save_cookies()
@@ -83,7 +96,25 @@ class BrowserSession:
         except Exception:
             pass
 
-    def goto(self, url: str, *, attempts: int = 4, settle_ms: int = 2000) -> None:
+    def _safe_title(self) -> str:
+        if not self.page:
+            return ""
+        try:
+            return (self.page.title() or "").strip()
+        except PlaywrightError as exc:
+            logger.warning("title() failed: %s", exc)
+            return ""
+
+    def _safe_content(self) -> str:
+        if not self.page:
+            return ""
+        try:
+            return self.page.content()
+        except PlaywrightError as exc:
+            logger.warning("content() failed: %s", exc)
+            return ""
+
+    def goto(self, url: str, *, attempts: int = 4, settle_ms: int = 1500) -> None:
         if not self.page:
             raise RuntimeError("Browser page is not initialized")
 
@@ -99,22 +130,26 @@ class BrowserSession:
                     continue
                 raise
 
-            for _ in range(40):
+            for tick in range(30):
                 self.page.wait_for_timeout(settle_ms)
-                title = (self.page.title() or "").strip().lower()
+                title = self._safe_title().lower()
                 if title and any(title.startswith(prefix) for prefix in INTERSTITIAL_PREFIXES):
                     continue
 
-                body = self.page.content()
+                body = self._safe_content()
+                if not body:
+                    continue
                 if 'data-testid="regular-results"' in body:
                     return
                 if listing_marker in body and (is_search or listing_marker in url):
                     return
                 if "__NEXT_DATA__" in body and not is_search:
                     return
+                if is_search and "__NEXT_DATA__" in body and listing_marker in body:
+                    return
         raise RuntimeError(f"Не удалось пройти защиту ricardo.ch для {url}")
 
-    def wait_for_search_results(self, *, attempts: int = 15, wait_ms: int = 2000) -> bool:
+    def wait_for_search_results(self, *, attempts: int = 12, wait_ms: int = 1500) -> bool:
         if not self.page:
             raise RuntimeError("Browser page is not initialized")
 
@@ -128,7 +163,11 @@ class BrowserSession:
     def evaluate(self, script: str) -> Any:
         if not self.page:
             raise RuntimeError("Browser page is not initialized")
-        return self.page.evaluate(script)
+        try:
+            return self.page.evaluate(script)
+        except PlaywrightError as exc:
+            logger.warning("evaluate() failed: %s", exc)
+            return None
 
     def evaluate_with_retry(self, script: str, *, attempts: int = 4, wait_ms: int = 1500) -> Any:
         for attempt in range(attempts):
