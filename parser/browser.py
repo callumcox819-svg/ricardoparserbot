@@ -87,6 +87,9 @@ class BrowserSession:
         if not self.page:
             raise RuntimeError("Browser page is not initialized")
 
+        is_search = f"/{self.locale}/s/" in url or url.rstrip("/").endswith(f"/{self.locale}/s")
+        listing_marker = f"/{self.locale}/a/"
+
         for attempt in range(attempts):
             try:
                 self.page.goto(url, timeout=90000, wait_until="domcontentloaded")
@@ -99,15 +102,28 @@ class BrowserSession:
             for _ in range(40):
                 self.page.wait_for_timeout(settle_ms)
                 title = (self.page.title() or "").strip().lower()
+                if title and any(title.startswith(prefix) for prefix in INTERSTITIAL_PREFIXES):
+                    continue
+
                 body = self.page.content()
-                if "__NEXT_DATA__" in body:
-                    return
                 if 'data-testid="regular-results"' in body:
                     return
-                if title and not any(title.startswith(prefix) for prefix in INTERSTITIAL_PREFIXES):
-                    if "/de/a/" in self.page.url or "/de/s/" in self.page.url or "/de/c/" in self.page.url:
-                        return
+                if listing_marker in body and (is_search or listing_marker in url):
+                    return
+                if "__NEXT_DATA__" in body and not is_search:
+                    return
         raise RuntimeError(f"Не удалось пройти защиту ricardo.ch для {url}")
+
+    def wait_for_search_results(self, *, attempts: int = 15, wait_ms: int = 2000) -> bool:
+        if not self.page:
+            raise RuntimeError("Browser page is not initialized")
+
+        listing_marker = f"/{self.locale}/a/"
+        script = f"""() => {{
+          if (document.querySelector('[data-testid="regular-results"]')) return true;
+          return document.querySelectorAll('a[href*="{listing_marker}"]').length > 0;
+        }}"""
+        return bool(self.evaluate_with_retry(script, attempts=attempts, wait_ms=wait_ms))
 
     def evaluate(self, script: str) -> Any:
         if not self.page:

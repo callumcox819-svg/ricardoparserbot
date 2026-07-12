@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
-from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
+from urllib.parse import quote, urljoin, urlparse, urlunparse, parse_qsl, urlencode
 
 from parser.browser import BrowserSession
 from parser.extract import (
     LISTING_HREF_RE,
     SEARCH_SUMMARY_JS,
     extract_article,
+    extract_listing_urls_from_next_data,
     extract_next_data,
     extract_phone,
     extract_product_jsonld,
@@ -26,6 +29,8 @@ from parser.formatter import (
     relative_time_ru,
 )
 from parser.models import VoidParserItem, VoidParserResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -60,6 +65,7 @@ class RicardoParser:
 
     def _parse_sync(self, start_url: str, progress: Callable[[str], Any] | None = None) -> VoidParserResult:
         def notify(message: str) -> None:
+            logger.info(message)
             if progress:
                 progress(message)
 
@@ -98,8 +104,13 @@ class RicardoParser:
 
         for page_num in range(1, self.config.max_pages + 1):
             page_url = self._with_page(normalized, page_num)
-            notify(f"Страница поиска {page_num}")
+            notify(f"Страница поиска {page_num}: {page_url}")
             session.goto(page_url)
+            if not session.wait_for_search_results():
+                title = session.evaluate("() => document.title || ''") or ""
+                current_url = session.page.url if session.page else page_url
+                notify(f"Результаты не загрузились. title={title!r}, url={current_url}")
+                break
             session.wait_for_next_data()
 
             summaries = session.evaluate(js)
@@ -114,9 +125,17 @@ class RicardoParser:
                         full += "/"
                     links.append(full)
             else:
-                links = self._extract_listing_links(session)
+                next_data = extract_next_data(session)
+                links = [
+                    urljoin(self.base_url + "/", href)
+                    for href in extract_listing_urls_from_next_data(next_data, locale=self.config.locale)
+                ]
+                if not links:
+                    links = self._extract_listing_links(session)
 
             if not links:
+                title = session.evaluate("() => document.title || ''") or ""
+                notify(f"Объявления не найдены на странице. title={title!r}")
                 break
 
             new_count = 0
@@ -318,8 +337,18 @@ class RicardoParser:
     def _normalize_start_url(self, url: str) -> str:
         parsed = urlparse(url.strip())
         if not parsed.netloc:
-            return urljoin(self.base_url + "/", url.lstrip("/"))
-        return urlunparse(parsed)
+            parsed = urlparse(urljoin(self.base_url + "/", url.lstrip("/")))
+
+        locale = self.config.locale
+        path = parsed.path.rstrip("/") or "/"
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+
+        if re.fullmatch(rf"/{locale}/s", path, re.I):
+            search_query = query.pop("q", None) or query.pop("query", None)
+            if search_query:
+                path = f"/{locale}/s/{quote(search_query, safe='')}"
+
+        return urlunparse(parsed._replace(path=path, query=urlencode(query)))
 
     def _with_page(self, url: str, page_num: int) -> str:
         parsed = urlparse(url)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from datetime import datetime
 from typing import Any
@@ -176,6 +177,7 @@ def build_dispatcher() -> Dispatcher:
 
 
 async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     global settings
     settings = get_settings()
     ensure_data_dir(settings.data_dir)

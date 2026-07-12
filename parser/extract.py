@@ -8,6 +8,7 @@ from parser.browser import BrowserSession
 from parser.formatter import deep_get
 
 LISTING_HREF_RE = re.compile(r"/[a-z]{2}/a/\d+/?", re.I)
+LISTING_PATH_RE = re.compile(r"/[a-z]{2}/a/\d+[^\"\\]*", re.I)
 
 SEARCH_SUMMARY_JS = """
 () => {
@@ -98,6 +99,50 @@ def extract_phone(data: dict[str, Any]) -> str:
                 if isinstance(subvalue, str) and subvalue.strip():
                     return subvalue.strip()
     return ""
+
+
+def extract_listing_urls_from_next_data(
+    next_data: dict[str, Any] | None,
+    *,
+    locale: str = "de",
+) -> list[str]:
+    if not next_data:
+        return []
+
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def add_url(href: str) -> None:
+        if not LISTING_HREF_RE.search(href):
+            return
+        normalized = href.split("?")[0]
+        if not normalized.endswith("/"):
+            normalized += "/"
+        if normalized not in seen:
+            seen.add(normalized)
+            urls.append(normalized)
+
+    queries = deep_get(next_data, "props", "pageProps", "dehydratedState", "queries", default=[]) or []
+    for query in queries:
+        data = deep_get(query, "state", "data")
+        if not isinstance(data, dict):
+            continue
+        for key in ("listings", "articles", "items", "results", "searchResults", "regularResults"):
+            listings = data.get(key)
+            if not isinstance(listings, list):
+                continue
+            for item in listings:
+                if not isinstance(item, dict):
+                    continue
+                href = item.get("url") or item.get("href") or item.get("permalink")
+                if isinstance(href, str):
+                    add_url(href)
+
+    raw = json.dumps(next_data, ensure_ascii=False)
+    for match in LISTING_PATH_RE.findall(raw):
+        add_url(match)
+
+    return urls
 
 
 def extract_next_data(session: BrowserSession) -> dict[str, Any] | None:
