@@ -50,3 +50,18 @@ def parse_playwright_proxy(proxy_url: str | None) -> dict[str, str] | None:
     if parsed.password:
         proxy["password"] = parsed.password
     return proxy
+
+
+def parse_requests_proxy(proxy_url: str | None) -> dict[str, str] | None:
+    playwright_proxy = parse_playwright_proxy(proxy_url)
+    if not playwright_proxy:
+        return None
+
+    server = playwright_proxy["server"]
+    username = playwright_proxy.get("username")
+    password = playwright_proxy.get("password")
+    if username and password:
+        parsed = urlparse(server)
+        server = f"{parsed.scheme}://{username}:{password}@{parsed.hostname}:{parsed.port}"
+
+    return {"http": server, "https": server}

@@ -146,6 +146,17 @@ class BrowserSession:
         except Exception:
             pass
 
+    def export_cookies_for_requests(self) -> dict[str, str]:
+        if not self.page:
+            return {}
+        cookies: dict[str, str] = {}
+        for cookie in self.page.context.cookies():
+            name = cookie.get("name")
+            value = cookie.get("value")
+            if name and value is not None:
+                cookies[name] = value
+        return cookies
+
     def _safe_title(self) -> str:
         if not self.page:
             return ""

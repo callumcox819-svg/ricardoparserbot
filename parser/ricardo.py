@@ -2,26 +2,23 @@ from __future__ import annotations
 
 import json
 import logging
-import multiprocessing as mp
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import quote, urljoin, urlparse, urlunparse, parse_qsl, urlencode
 
 from parser.browser import BrowserSession
-from parser.detail_worker import parse_detail_batch
 from parser.extract import (
     LISTING_HREF_RE,
     SEARCH_SUMMARY_JS,
     extract_article,
     extract_next_data,
     extract_phone,
-    extract_product_jsonld,
     extract_search_summaries_from_next_data,
-    extract_seller_stats_from_state,
     first_int,
 )
+from parser.http_fetch import fetch_listing_payload
 from parser.formatter import (
     deep_get,
     format_price,
@@ -45,8 +42,7 @@ class ParserConfig:
     cookies_path: str | None = None
     enrich_details: bool = True
     visit_seller_profile: bool = False
-    detail_batch_size: int = 8
-    detail_timeout_sec: int = 180
+    http_fetch_delay_sec: float = 0.2
 
 
 @dataclass
@@ -87,8 +83,10 @@ class RicardoParser:
                 progress(message)
 
         notify("Запуск Camoufox...")
+        cookies: dict[str, str] = {}
         with self._session() as session:
             summaries = self._collect_listings(session, start_url, notify)
+            cookies = session.export_cookies_for_requests()
 
         notify(f"Найдено объявлений: {len(summaries)}")
         if not self.config.enrich_details:
@@ -97,60 +95,168 @@ class RicardoParser:
             notify(f"Готово к сохранению: {len(items)} объявлений")
             return VoidParserResult(items=items)
 
-        notify("Открываю карточки для имён продавцов и статистики...")
-        items = self._enrich_summaries_in_batches(summaries, notify)
+        notify("Загружаю карточки по HTTP для имён продавцов и статистики...")
+        items = self._enrich_summaries_via_http(summaries, cookies, notify)
         return VoidParserResult(items=items)
 
-    def _enrich_summaries_in_batches(
+    def _enrich_summaries_via_http(
         self,
         summaries: list[SearchSummary],
+        cookies: dict[str, str],
         notify: Callable[[str], None],
     ) -> list[VoidParserItem]:
-        items: list[VoidParserItem | None] = [None] * len(summaries)
-        config_dict = asdict(self.config)
-        index = 0
+        items: list[VoidParserItem] = []
+        enriched = 0
 
-        while index < len(summaries):
-            end = min(index + self.config.detail_batch_size, len(summaries))
-            notify(f"Парсинг {index + 1}-{end}/{len(summaries)}")
-            batch = [asdict(summary) for summary in summaries[index:end]]
-            results = self._run_detail_batch(batch, config_dict, index)
+        for index, summary in enumerate(summaries, start=1):
+            if index == 1 or index % 10 == 0 or index == len(summaries):
+                notify(f"Парсинг {index}/{len(summaries)}")
 
-            if not results:
-                for pos in range(index, end):
-                    items[pos] = self._item_from_summary(summaries[pos])
-                index = end
-                continue
+            item: VoidParserItem | None = None
+            try:
+                payload = fetch_listing_payload(
+                    summary.url,
+                    cookies=cookies,
+                    proxy_url=self.config.proxy_url,
+                    locale=self.config.locale,
+                )
+                item = self._build_item_from_payload(summary, payload)
+                if item and item.item_person_name:
+                    enriched += 1
+            except Exception as exc:
+                logger.warning("HTTP listing fetch failed for %s: %s", summary.url, exc)
 
-            last_index = index
-            for global_index, item_dict in results:
-                if item_dict:
-                    items[global_index] = VoidParserItem(**item_dict)
-                else:
-                    items[global_index] = self._item_from_summary(summaries[global_index])
-                last_index = max(last_index, global_index + 1)
+            if item is None:
+                item = self._item_from_summary(summary)
+            items.append(item)
+            time.sleep(self.config.http_fetch_delay_sec)
 
-            index = last_index if last_index > index else end
+        notify(f"Детали получены для {enriched}/{len(summaries)} объявлений")
+        return items
 
-        return [item if item is not None else self._item_from_summary(summaries[i]) for i, item in enumerate(items)]
-
-    def _run_detail_batch(
+    def _build_item_from_payload(
         self,
-        batch: list[dict[str, Any]],
-        config_dict: dict[str, Any],
-        start_index: int,
-    ) -> list[tuple[int, dict[str, Any] | None]]:
-        ctx = mp.get_context("spawn")
-        pool = ctx.Pool(1)
-        try:
-            async_result = pool.apply_async(parse_detail_batch, (batch, config_dict, start_index))
-            return async_result.get(timeout=self.config.detail_timeout_sec)
-        except Exception as exc:
-            logger.warning("Detail batch failed at %s: %s", start_index, exc)
-            return []
-        finally:
-            pool.terminate()
-            pool.join()
+        summary: SearchSummary,
+        payload: dict[str, Any],
+    ) -> VoidParserItem | None:
+        next_data = payload.get("next_data")
+        if not next_data:
+            return None
+
+        article = extract_article(next_data)
+        if not article:
+            return None
+
+        product = payload.get("product") or {}
+        seller = article.get("seller") or {}
+        offer = article.get("offer") or {}
+        nickname = str(
+            seller.get("nickname")
+            or summary.seller_name
+            or deep_get(product, "offers", "seller", "name")
+            or ""
+        )
+        seller_id = str(seller.get("id") or "")
+
+        seller_stats = self._seller_stats_from_data(seller, nickname, seller_id)
+
+        title = article.get("title") or deep_get(product, "name") or summary.title or ""
+        image = pick_image_url(article.get("images") or deep_get(product, "image")) or summary.image
+        price_value = (
+            offer.get("price")
+            or deep_get(product, "offers", "price")
+            or article.get("buyNowPrice")
+            or article.get("buy_now_price")
+            or summary.price
+        )
+        created_raw = (
+            article.get("creationDate")
+            or article.get("creation_date")
+            or offer.get("start_date")
+            or offer.get("startDate")
+        )
+        reg_raw = (
+            seller_stats.get("registration_date")
+            or seller.get("memberSince")
+            or seller.get("registrationDate")
+            or seller.get("createdAt")
+        )
+
+        listing_url = summary.url
+        parser_views = self._view_counts.get(listing_url, 0)
+        self._view_counts[listing_url] = parser_views + 1
+
+        return VoidParserItem(
+            item_title=str(title).strip(),
+            item_photo=image,
+            ads_number=first_int(
+                seller_stats,
+                "ads_number",
+                "articleCount",
+                "article_count",
+                default=first_int(seller, "articleCount", "article_count"),
+            ),
+            parser_views=parser_views,
+            ads_number_bought=first_int(
+                seller_stats,
+                "ads_number_bought",
+                "purchasesCount",
+                "purchaseCount",
+                "purchase_count",
+                "boughtCount",
+                default=first_int(seller, "purchasesCount", "purchaseCount", "purchase_count", "boughtCount"),
+            ),
+            ads_number_sold=first_int(
+                seller_stats,
+                "ads_number_sold",
+                "salesCount",
+                "soldCount",
+                "sales_count",
+                "completedSales",
+                default=first_int(seller, "salesCount", "soldCount", "sales_count", "completedSales"),
+            ),
+            gender="",
+            email="",
+            person_reg_date=relative_time_ru(parse_iso_datetime(reg_raw)),
+            item_price=format_price(price_value),
+            views=None,
+            rating=rating_from_score(seller_stats.get("rating") or seller.get("score")),
+            created_date=relative_time_ru(parse_iso_datetime(created_raw)) or summary.created_date,
+            created_real_date="",
+            phone=str(seller_stats.get("phone") or extract_phone(seller)),
+            item_desc="",
+            location="",
+            item_link=listing_url,
+            person_link=str(self._seller_profile_url(seller, nickname, seller_id) or summary.person_link or ""),
+            item_person_name=nickname,
+        )
+
+    def _seller_stats_from_data(
+        self,
+        seller: dict[str, Any],
+        nickname: str,
+        seller_id: str,
+    ) -> dict[str, Any]:
+        cache_key = seller_id or nickname
+        if cache_key and cache_key in self._seller_cache:
+            return self._seller_cache[cache_key]
+
+        stats = {
+            "ads_number": first_int(seller, "articleCount", "article_count"),
+            "ads_number_bought": first_int(
+                seller, "purchasesCount", "purchaseCount", "purchase_count", "boughtCount"
+            ),
+            "ads_number_sold": first_int(
+                seller, "salesCount", "soldCount", "sales_count", "completedSales"
+            ),
+            "rating": seller.get("score"),
+            "phone": extract_phone(seller),
+            "registration_date": seller.get("memberSince") or seller.get("registrationDate") or seller.get("createdAt"),
+        }
+
+        if cache_key:
+            self._seller_cache[cache_key] = stats
+        return stats
 
     def _item_from_summary(self, summary: SearchSummary) -> VoidParserItem:
         parser_views = self._view_counts.get(summary.url, 0)
@@ -298,169 +404,6 @@ class RicardoParser:
                 full += "/"
             links.append(full)
         return list(dict.fromkeys(links))
-
-    def _parse_listing(self, session: BrowserSession, summary: SearchSummary) -> VoidParserItem | None:
-        listing_url = summary.url
-        session.goto(listing_url)
-        if not session.wait_for_next_data():
-            raise RuntimeError("Не удалось получить __NEXT_DATA__")
-
-        next_data = extract_next_data(session)
-        article = extract_article(next_data)
-        product = extract_product_jsonld(session)
-
-        seller = article.get("seller") or {}
-        offer = article.get("offer") or {}
-        nickname = str(
-            seller.get("nickname")
-            or summary.seller_name
-            or deep_get(product, "offers", "seller", "name")
-            or ""
-        )
-        seller_id = str(seller.get("id") or "")
-
-        seller_stats = self._get_seller_stats(session, seller, nickname, seller_id)
-
-        title = article.get("title") or deep_get(product, "name") or summary.title or ""
-        image = pick_image_url(article.get("images") or deep_get(product, "image")) or summary.image
-        price_value = (
-            offer.get("price")
-            or deep_get(product, "offers", "price")
-            or article.get("buyNowPrice")
-            or article.get("buy_now_price")
-            or summary.price
-        )
-        created_raw = (
-            article.get("creationDate")
-            or article.get("creation_date")
-            or offer.get("start_date")
-            or offer.get("startDate")
-        )
-        reg_raw = (
-            seller_stats.get("registration_date")
-            or seller.get("memberSince")
-            or seller.get("registrationDate")
-            or seller.get("createdAt")
-        )
-
-        parser_views = self._view_counts.get(listing_url, 0)
-        self._view_counts[listing_url] = parser_views + 1
-
-        return VoidParserItem(
-            item_title=str(title).strip(),
-            item_photo=image,
-            ads_number=first_int(
-                seller_stats,
-                "ads_number",
-                "articleCount",
-                "article_count",
-                default=first_int(seller, "articleCount", "article_count"),
-            ),
-            parser_views=parser_views,
-            ads_number_bought=first_int(
-                seller_stats,
-                "ads_number_bought",
-                "purchasesCount",
-                "purchaseCount",
-                "purchase_count",
-                "boughtCount",
-                default=first_int(seller, "purchasesCount", "purchaseCount", "purchase_count", "boughtCount"),
-            ),
-            ads_number_sold=first_int(
-                seller_stats,
-                "ads_number_sold",
-                "salesCount",
-                "soldCount",
-                "sales_count",
-                "completedSales",
-                default=first_int(seller, "salesCount", "soldCount", "sales_count", "completedSales"),
-            ),
-            gender="",
-            email="",
-            person_reg_date=relative_time_ru(parse_iso_datetime(reg_raw)),
-            item_price=format_price(price_value),
-            views=None,
-            rating=rating_from_score(seller_stats.get("rating") or seller.get("score")),
-            created_date=relative_time_ru(parse_iso_datetime(created_raw)),
-            created_real_date="",
-            phone=str(seller_stats.get("phone") or extract_phone(seller)),
-            item_desc="",
-            location="",
-            item_link=listing_url,
-            person_link=str(self._seller_profile_url(seller, nickname, seller_id) or summary.person_link or ""),
-            item_person_name=nickname,
-        )
-
-    def _get_seller_stats(
-        self,
-        session: BrowserSession,
-        seller: dict[str, Any],
-        nickname: str,
-        seller_id: str,
-    ) -> dict[str, Any]:
-        cache_key = seller_id or nickname
-        if cache_key and cache_key in self._seller_cache:
-            return self._seller_cache[cache_key]
-
-        stats = {
-            "ads_number": first_int(seller, "articleCount", "article_count"),
-            "ads_number_bought": first_int(
-                seller, "purchasesCount", "purchaseCount", "purchase_count", "boughtCount"
-            ),
-            "ads_number_sold": first_int(
-                seller, "salesCount", "soldCount", "sales_count", "completedSales"
-            ),
-            "rating": seller.get("score"),
-            "phone": extract_phone(seller),
-            "registration_date": seller.get("memberSince") or seller.get("registrationDate") or seller.get("createdAt"),
-        }
-
-        seller_url = self._seller_profile_url(seller, nickname, seller_id)
-        needs_profile = (
-            self.config.visit_seller_profile
-            and seller_url
-            and (not stats["ads_number_bought"] or not stats["ads_number_sold"] or not stats["registration_date"])
-        )
-        if needs_profile and session.is_alive():
-            try:
-                session.goto(seller_url)
-                session.wait_for_next_data()
-                seller_next = extract_next_data(session)
-                seller_data = extract_seller_stats_from_state(seller_next) or extract_article(seller_next).get("seller") or {}
-                if seller_data:
-                    stats["ads_number"] = first_int(
-                        seller_data, "articleCount", "article_count", default=stats["ads_number"]
-                    )
-                    stats["ads_number_bought"] = first_int(
-                        seller_data,
-                        "purchasesCount",
-                        "purchaseCount",
-                        "purchase_count",
-                        "boughtCount",
-                        default=stats["ads_number_bought"],
-                    )
-                    stats["ads_number_sold"] = first_int(
-                        seller_data,
-                        "salesCount",
-                        "soldCount",
-                        "sales_count",
-                        "completedSales",
-                        default=stats["ads_number_sold"],
-                    )
-                    stats["rating"] = seller_data.get("score") or stats["rating"]
-                    stats["phone"] = extract_phone(seller_data) or stats["phone"]
-                    stats["registration_date"] = (
-                        seller_data.get("memberSince")
-                        or seller_data.get("registrationDate")
-                        or seller_data.get("createdAt")
-                        or stats["registration_date"]
-                    )
-            except Exception:
-                pass
-
-        if cache_key:
-            self._seller_cache[cache_key] = stats
-        return stats
 
     def _seller_profile_url(self, seller: dict[str, Any], nickname: str, seller_id: str) -> str | None:
         for key in ("shopUrl", "sellerUrl", "profileUrl", "url"):
