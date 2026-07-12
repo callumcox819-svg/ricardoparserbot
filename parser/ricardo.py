@@ -16,10 +16,8 @@ from parser.extract import (
     extract_next_data,
     extract_phone,
     extract_search_summaries_from_next_data,
-    extract_seller_stats_from_state,
     first_int,
 )
-from parser.http_fetch import parse_listing_payload_from_html
 from parser.formatter import (
     deep_get,
     format_price,
@@ -43,7 +41,8 @@ class ParserConfig:
     cookies_path: str | None = None
     enrich_details: bool = True
     visit_seller_profile: bool = False
-    http_fetch_delay_sec: float = 0.1
+    listing_delay_sec: float = 1.0
+    session_refresh_every: int = 20
 
 
 @dataclass
@@ -63,6 +62,11 @@ class RicardoParser:
         self.base_url = f"https://www.ricardo.ch/{config.locale}"
         self._view_counts: dict[str, int] = {}
         self._seller_cache: dict[str, dict[str, Any]] = {}
+        self._last_search_url = ""
+
+    def _search_refresh_url(self, start_url: str) -> str:
+        normalized = self._normalize_start_url(start_url)
+        return self._with_page(normalized, 1)
 
     async def parse(self, start_url: str, progress: Callable[[str], Any] | None = None):
         import asyncio
@@ -84,6 +88,7 @@ class RicardoParser:
                 progress(message)
 
         notify("Запуск Camoufox...")
+        refresh_url = self._search_refresh_url(start_url)
         with self._session() as session:
             summaries = self._collect_listings(session, start_url, notify)
             notify(f"Найдено объявлений: {len(summaries)}")
@@ -93,64 +98,54 @@ class RicardoParser:
                 notify(f"Готово к сохранению: {len(items)} объявлений")
                 return VoidParserResult(items=items)
 
-            notify("Загружаю детали объявлений (без JS, стабильный режим)...")
-            session.switch_to_nojs_mode()
-            items = self._enrich_summaries_nojs(session, summaries, notify)
+            notify("Загружаю детали объявлений...")
+            items = self._enrich_summaries(session, summaries, refresh_url, notify)
             return VoidParserResult(items=items)
 
-    def _enrich_summaries_nojs(
+    def _enrich_summaries(
         self,
         session: BrowserSession,
         summaries: list[SearchSummary],
+        refresh_url: str,
         notify: Callable[[str], None],
     ) -> list[VoidParserItem]:
         items: list[VoidParserItem] = []
         enriched = 0
-        seller_profile_cache: dict[str, dict[str, Any]] = {}
+        failed = 0
 
         for index, summary in enumerate(summaries, start=1):
             if index == 1 or index % 10 == 0 or index == len(summaries):
                 notify(f"Парсинг {index}/{len(summaries)}")
 
+            if index > 1 and index % self.config.session_refresh_every == 0:
+                notify("Обновляю сессию после captcha-лимита...")
+                try:
+                    session.refresh_search_session(refresh_url)
+                except Exception as exc:
+                    logger.warning("Session refresh failed: %s", exc)
+
             item: VoidParserItem | None = None
             try:
-                html = session.fetch_html(summary.url)
-                if "Ricardo Captcha" in html or "__NEXT_DATA__" not in html:
+                next_data = session.fetch_listing_next_data(summary.url)
+                if not next_data:
                     raise RuntimeError("captcha or missing __NEXT_DATA__")
-                payload = parse_listing_payload_from_html(html)
-                item = self._build_item_from_payload(summary, payload)
+                item = self._build_item_from_payload(summary, {"next_data": next_data, "product": {}})
                 if not item:
                     raise RuntimeError("empty article")
-
-                nickname = item.item_person_name
-                if nickname and self.config.visit_seller_profile:
-                    if nickname not in seller_profile_cache:
-                        shop_url = f"{self.base_url}/shop/{nickname}/offers"
-                        try:
-                            shop_html = session.fetch_html(shop_url)
-                            if "__NEXT_DATA__" in shop_html:
-                                shop_payload = parse_listing_payload_from_html(shop_html)
-                                seller_profile_cache[nickname] = (
-                                    extract_seller_stats_from_state(shop_payload.get("next_data")) or {}
-                                )
-                            else:
-                                seller_profile_cache[nickname] = {}
-                        except Exception as exc:
-                            logger.warning("Seller profile fetch failed for %s: %s", nickname, exc)
-                            seller_profile_cache[nickname] = {}
-                    item = self._apply_seller_stats(item, seller_profile_cache.get(nickname) or {})
-
-                if item.item_person_name:
+                if item.item_person_name or item.ads_number or item.rating:
                     enriched += 1
             except Exception as exc:
+                failed += 1
                 logger.warning("Listing fetch failed for %s: %s", summary.url, exc)
                 item = self._item_from_summary(summary)
 
             items.append(item)
-            if self.config.http_fetch_delay_sec:
-                time.sleep(self.config.http_fetch_delay_sec)
+            if self.config.listing_delay_sec:
+                time.sleep(self.config.listing_delay_sec)
 
         notify(f"Детали получены для {enriched}/{len(summaries)} объявлений")
+        if failed:
+            notify(f"Не удалось загрузить {failed} карточек (captcha/блокировка)")
         return items
 
     def _apply_seller_stats(self, item: VoidParserItem, stats: dict[str, Any]) -> VoidParserItem:

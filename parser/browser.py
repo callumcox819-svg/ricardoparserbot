@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -14,6 +15,12 @@ from parser.proxy import parse_playwright_proxy
 from pin_camoufox_browser import ensure_pinned_browser
 
 logger = logging.getLogger(__name__)
+
+NEXT_DATA_SCRIPT = "document.getElementById('__NEXT_DATA__')?.textContent || null"
+NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+    re.DOTALL | re.IGNORECASE,
+)
 
 INTERSTITIAL_PREFIXES = (
     "loading",
@@ -32,6 +39,12 @@ BLOCKED_HOST_PARTS = (
     "doubleclick.net",
     "criteo.com",
     "taboola.com",
+)
+
+ALLOWED_HOST_SUFFIXES = (
+    "ricardo.ch",
+    "ricardostatic.ch",
+    "kxcdn.com",
 )
 
 ERROR_SWALLOW_INIT_SCRIPT = """
@@ -94,23 +107,75 @@ class BrowserSession:
             return
 
         cookies = self.page.context.cookies()
-        try:
-            self.page.close()
-        except Exception:
-            pass
-        try:
-            self._js_context.close()
-        except Exception:
-            pass
-
         self._nojs_context = self.browser.new_context(
             java_script_enabled=False,
             locale=f"{self.locale}-CH",
         )
         if cookies:
             self._nojs_context.add_cookies(cookies)
-        self.page = self._nojs_context.new_page()
-        self.page.set_default_timeout(45000)
+
+    def refresh_search_session(self, search_url: str) -> None:
+        if not self.page:
+            raise RuntimeError("Browser page is not initialized")
+        self.goto(search_url)
+        self.wait_for_search_results()
+
+    def fetch_listing_next_data(self, url: str) -> dict[str, Any] | None:
+        if not self.browser or not self._js_context:
+            raise RuntimeError("Browser session is not initialized")
+
+        for mode in ("js", "nojs"):
+            page: Page | None = None
+            try:
+                if mode == "js":
+                    page = self._js_context.new_page()
+                    page.set_default_timeout(45000)
+                    page.add_init_script(ERROR_SWALLOW_INIT_SCRIPT)
+                    page.route("**/*", self._route_strict)
+                else:
+                    self.switch_to_nojs_mode()
+                    page = self._nojs_context.new_page()
+                    page.set_default_timeout(45000)
+
+                page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                raw = self._read_next_data(page, mode=mode)
+                if raw:
+                    return json.loads(raw)
+            except Exception as exc:
+                logger.warning("Listing fetch %s via %s failed: %s", url, mode, exc)
+            finally:
+                if page is not None:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+        return None
+
+    def _read_next_data(self, page: Page, *, mode: str) -> str | None:
+        if mode == "js":
+            title = (page.title() or "").lower()
+            if title and any(title.startswith(prefix) for prefix in INTERSTITIAL_PREFIXES):
+                return None
+            return page.evaluate(f"() => {NEXT_DATA_SCRIPT}")
+
+        html = page.content()
+        if "Ricardo Captcha" in html or "ricardo captcha" in html.lower():
+            return None
+        match = NEXT_DATA_RE.search(html)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _route_strict(route: Any, request: Any) -> None:
+        host = urlparse(request.url).netloc.lower()
+        if any(part in host for part in BLOCKED_HOST_PARTS):
+            route.abort()
+            return
+        if request.resource_type == "script" and not any(
+            host == suffix or host.endswith(f".{suffix}") for suffix in ALLOWED_HOST_SUFFIXES
+        ):
+            route.abort()
+            return
+        route.continue_()
 
     def fetch_html(self, url: str, *, timeout: int = 45000) -> str:
         if not self.page:
