@@ -15,6 +15,7 @@ class Settings:
     headless: bool
     locale: str
     data_dir: str
+    cookies_path: str
 
 
 def get_settings() -> Settings:
@@ -28,6 +29,7 @@ def get_settings() -> Settings:
     headless = os.getenv("HEADLESS", "true").lower() in {"1", "true", "yes", "on"}
     locale = os.getenv("LOCALE", "de").strip() or "de"
     data_dir = os.getenv("DATA_DIR", "data").strip() or "data"
+    cookies_path = os.getenv("COOKIES_PATH", os.path.join(data_dir, "ricardo_cookies.json"))
 
     return Settings(
         bot_token=token,
@@ -37,4 +39,5 @@ def get_settings() -> Settings:
         headless=headless,
         locale=locale,
         data_dir=data_dir,
+        cookies_path=cookies_path,
     )

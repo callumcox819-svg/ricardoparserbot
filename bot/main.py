@@ -33,6 +33,11 @@ async def run_parse_job(user_id: int, bot: Bot, start_url: str) -> None:
         except Exception:
             pass
 
+    loop = asyncio.get_running_loop()
+
+    def sync_progress(message: str) -> None:
+        asyncio.run_coroutine_threadsafe(progress(message), loop)
+
     parser = RicardoParser(
         ParserConfig(
             locale=cfg.locale,
@@ -40,12 +45,13 @@ async def run_parse_job(user_id: int, bot: Bot, start_url: str) -> None:
             max_items=cfg.max_items,
             headless=cfg.headless,
             proxy_url=cfg.proxy_url,
+            cookies_path=cfg.cookies_path,
         )
     )
 
     try:
         await progress("Парсинг запущен...")
-        result: VoidParserResult = await parser.parse(start_url, progress=progress)
+        result: VoidParserResult = await parser.parse(start_url, progress=sync_progress)
         timestamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
         filename = f"void-parser-result {timestamp}.json"
         filepath = os.path.join(cfg.data_dir, filename)
