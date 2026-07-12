@@ -12,11 +12,11 @@ from parser.proxy import parse_requests_proxy
 logger = logging.getLogger(__name__)
 
 NEXT_DATA_RE = re.compile(
-    r'<script id="__NEXT_DATA__"[^>]*type="application/json"[^>]*>(.*?)</script>',
+    r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
     re.DOTALL | re.IGNORECASE,
 )
 JSON_LD_RE = re.compile(
-    r'<script id="pdp-json-ld"[^>]*type="application/json"[^>]*>(.*?)</script>',
+    r'<script id="pdp-json-ld"[^>]*>(.*?)</script>',
     re.DOTALL | re.IGNORECASE,
 )
 
@@ -26,6 +26,12 @@ DEFAULT_HEADERS = {
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
 }
+
+
+def parse_listing_payload_from_html(html: str) -> dict[str, Any]:
+    next_data = _extract_json(NEXT_DATA_RE, html)
+    product_jsonld = _extract_product_jsonld(html)
+    return {"next_data": next_data, "product": product_jsonld}
 
 
 def fetch_listing_payload(
@@ -49,11 +55,7 @@ def fetch_listing_payload(
     proxies = parse_requests_proxy(proxy_url)
     response = session.get(url, timeout=timeout, proxies=proxies, allow_redirects=True)
     response.raise_for_status()
-
-    html = response.text
-    next_data = _extract_json(NEXT_DATA_RE, html)
-    product_jsonld = _extract_product_jsonld(html)
-    return {"next_data": next_data, "product": product_jsonld}
+    return parse_listing_payload_from_html(response.text)
 
 
 def _extract_json(pattern: re.Pattern[str], html: str) -> dict[str, Any] | None:

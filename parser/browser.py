@@ -64,6 +64,8 @@ class BrowserSession:
         self._camoufox: Camoufox | None = None
         self.browser = None
         self.page: Page | None = None
+        self._js_context = None
+        self._nojs_context = None
 
     def __enter__(self) -> "BrowserSession":
         ensure_pinned_browser()
@@ -79,10 +81,42 @@ class BrowserSession:
 
         self._camoufox = Camoufox(**launch_kwargs)
         self.browser = self._camoufox.__enter__()
-        self.page = self.browser.new_page()
+        self._js_context = self.browser.new_context(locale=f"{self.locale}-CH")
+        self.page = self._js_context.new_page()
         self._configure_page(self.page)
         self._load_cookies()
         return self
+
+    def switch_to_nojs_mode(self) -> None:
+        if not self.page or not self.browser:
+            raise RuntimeError("Browser session is not initialized")
+        if self._nojs_context is not None:
+            return
+
+        cookies = self.page.context.cookies()
+        try:
+            self.page.close()
+        except Exception:
+            pass
+        try:
+            self._js_context.close()
+        except Exception:
+            pass
+
+        self._nojs_context = self.browser.new_context(
+            java_script_enabled=False,
+            locale=f"{self.locale}-CH",
+        )
+        if cookies:
+            self._nojs_context.add_cookies(cookies)
+        self.page = self._nojs_context.new_page()
+        self.page.set_default_timeout(45000)
+
+    def fetch_html(self, url: str, *, timeout: int = 45000) -> str:
+        if not self.page:
+            raise RuntimeError("Browser page is not initialized")
+        self.page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+        return self.page.content()
 
     def _configure_page(self, page: Page) -> None:
         page.set_default_timeout(45000)
@@ -121,8 +155,17 @@ class BrowserSession:
 
     def __exit__(self, *exc_info: object) -> None:
         self._save_cookies()
+        for context in (self._nojs_context, self._js_context):
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
         if self._camoufox is not None:
-            self._camoufox.__exit__(*exc_info)
+            try:
+                self._camoufox.__exit__(*exc_info)
+            except Exception as exc:
+                logger.warning("Camoufox shutdown error (ignored): %s", exc)
 
     def _load_cookies(self) -> None:
         if not self.cookies_path or not os.path.exists(self.cookies_path) or not self.page:

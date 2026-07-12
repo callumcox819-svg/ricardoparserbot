@@ -94,8 +94,9 @@ async def on_start(message: Message) -> None:
         "/results — отправить последний JSON\n\n"
         "Пример:\n"
         "/parse https://www.ricardo.ch/de/s/?q=laptop\n\n"
-        "По умолчанию бот собирает имена продавцов через HTTP (стабильно).\n"
-        "Только поиск без имён: Railway Variable `ENRICH_DETAILS=false`.\n\n"
+        "По умолчанию бот собирает имена продавцов, рейтинг и даты с карточек.\n"
+        "Только поиск (быстро, без имён): `ENRICH_DETAILS=false`.\n"
+        "Меньше объявлений = быстрее: `MAX_ITEMS=30`.\n\n"
         "Токен бота берётся из Railway Variable `BOT_TOKEN`."
     )
 

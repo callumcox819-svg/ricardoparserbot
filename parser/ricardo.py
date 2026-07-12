@@ -16,9 +16,10 @@ from parser.extract import (
     extract_next_data,
     extract_phone,
     extract_search_summaries_from_next_data,
+    extract_seller_stats_from_state,
     first_int,
 )
-from parser.http_fetch import fetch_listing_payload
+from parser.http_fetch import parse_listing_payload_from_html
 from parser.formatter import (
     deep_get,
     format_price,
@@ -42,7 +43,7 @@ class ParserConfig:
     cookies_path: str | None = None
     enrich_details: bool = True
     visit_seller_profile: bool = False
-    http_fetch_delay_sec: float = 0.2
+    http_fetch_delay_sec: float = 0.1
 
 
 @dataclass
@@ -83,30 +84,29 @@ class RicardoParser:
                 progress(message)
 
         notify("Запуск Camoufox...")
-        cookies: dict[str, str] = {}
         with self._session() as session:
             summaries = self._collect_listings(session, start_url, notify)
-            cookies = session.export_cookies_for_requests()
+            notify(f"Найдено объявлений: {len(summaries)}")
+            if not self.config.enrich_details:
+                notify("Собираю JSON из результатов поиска (без детальных страниц)")
+                items = [self._item_from_summary(summary) for summary in summaries]
+                notify(f"Готово к сохранению: {len(items)} объявлений")
+                return VoidParserResult(items=items)
 
-        notify(f"Найдено объявлений: {len(summaries)}")
-        if not self.config.enrich_details:
-            notify("Собираю JSON из результатов поиска (без детальных страниц)")
-            items = [self._item_from_summary(summary) for summary in summaries]
-            notify(f"Готово к сохранению: {len(items)} объявлений")
+            notify("Загружаю детали объявлений (без JS, стабильный режим)...")
+            session.switch_to_nojs_mode()
+            items = self._enrich_summaries_nojs(session, summaries, notify)
             return VoidParserResult(items=items)
 
-        notify("Загружаю карточки по HTTP для имён продавцов и статистики...")
-        items = self._enrich_summaries_via_http(summaries, cookies, notify)
-        return VoidParserResult(items=items)
-
-    def _enrich_summaries_via_http(
+    def _enrich_summaries_nojs(
         self,
+        session: BrowserSession,
         summaries: list[SearchSummary],
-        cookies: dict[str, str],
         notify: Callable[[str], None],
     ) -> list[VoidParserItem]:
         items: list[VoidParserItem] = []
         enriched = 0
+        seller_profile_cache: dict[str, dict[str, Any]] = {}
 
         for index, summary in enumerate(summaries, start=1):
             if index == 1 or index % 10 == 0 or index == len(summaries):
@@ -114,25 +114,72 @@ class RicardoParser:
 
             item: VoidParserItem | None = None
             try:
-                payload = fetch_listing_payload(
-                    summary.url,
-                    cookies=cookies,
-                    proxy_url=self.config.proxy_url,
-                    locale=self.config.locale,
-                )
+                html = session.fetch_html(summary.url)
+                if "Ricardo Captcha" in html or "__NEXT_DATA__" not in html:
+                    raise RuntimeError("captcha or missing __NEXT_DATA__")
+                payload = parse_listing_payload_from_html(html)
                 item = self._build_item_from_payload(summary, payload)
-                if item and item.item_person_name:
+                if not item:
+                    raise RuntimeError("empty article")
+
+                nickname = item.item_person_name
+                if nickname and self.config.visit_seller_profile:
+                    if nickname not in seller_profile_cache:
+                        shop_url = f"{self.base_url}/shop/{nickname}/offers"
+                        try:
+                            shop_html = session.fetch_html(shop_url)
+                            if "__NEXT_DATA__" in shop_html:
+                                shop_payload = parse_listing_payload_from_html(shop_html)
+                                seller_profile_cache[nickname] = (
+                                    extract_seller_stats_from_state(shop_payload.get("next_data")) or {}
+                                )
+                            else:
+                                seller_profile_cache[nickname] = {}
+                        except Exception as exc:
+                            logger.warning("Seller profile fetch failed for %s: %s", nickname, exc)
+                            seller_profile_cache[nickname] = {}
+                    item = self._apply_seller_stats(item, seller_profile_cache.get(nickname) or {})
+
+                if item.item_person_name:
                     enriched += 1
             except Exception as exc:
-                logger.warning("HTTP listing fetch failed for %s: %s", summary.url, exc)
-
-            if item is None:
+                logger.warning("Listing fetch failed for %s: %s", summary.url, exc)
                 item = self._item_from_summary(summary)
+
             items.append(item)
-            time.sleep(self.config.http_fetch_delay_sec)
+            if self.config.http_fetch_delay_sec:
+                time.sleep(self.config.http_fetch_delay_sec)
 
         notify(f"Детали получены для {enriched}/{len(summaries)} объявлений")
         return items
+
+    def _apply_seller_stats(self, item: VoidParserItem, stats: dict[str, Any]) -> VoidParserItem:
+        if not stats:
+            return item
+        reg_raw = stats.get("memberSince") or stats.get("registrationDate") or stats.get("createdAt")
+        item.ads_number = first_int(stats, "articleCount", "article_count", default=item.ads_number)
+        item.ads_number_bought = first_int(
+            stats,
+            "purchasesCount",
+            "purchaseCount",
+            "purchase_count",
+            "boughtCount",
+            default=item.ads_number_bought,
+        )
+        item.ads_number_sold = first_int(
+            stats,
+            "salesCount",
+            "soldCount",
+            "sales_count",
+            "completedSales",
+            default=item.ads_number_sold,
+        )
+        item.rating = rating_from_score(stats.get("score")) or item.rating
+        item.person_reg_date = relative_time_ru(parse_iso_datetime(reg_raw)) or item.person_reg_date
+        phone = extract_phone(stats)
+        if phone:
+            item.phone = phone
+        return item
 
     def _build_item_from_payload(
         self,
