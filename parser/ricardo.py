@@ -13,10 +13,10 @@ from parser.extract import (
     LISTING_HREF_RE,
     SEARCH_SUMMARY_JS,
     extract_article,
-    extract_listing_urls_from_next_data,
     extract_next_data,
     extract_phone,
     extract_product_jsonld,
+    extract_search_summaries_from_next_data,
     extract_seller_stats_from_state,
     first_int,
 )
@@ -41,6 +41,15 @@ class ParserConfig:
     headless: bool = True
     proxy_url: str | None = None
     cookies_path: str | None = None
+
+
+@dataclass
+class SearchSummary:
+    url: str
+    title: str = ""
+    price: Any = None
+    image: str = ""
+    seller_name: str = ""
 
 
 class RicardoParser:
@@ -71,34 +80,71 @@ class RicardoParser:
 
         notify("Запуск Camoufox...")
         with self._session() as session:
-            listing_urls = self._collect_listing_urls(session, start_url, notify)
+            summaries = self._collect_listings(session, start_url, notify)
 
-        notify(f"Найдено объявлений: {len(listing_urls)}")
+        notify(f"Найдено объявлений: {len(summaries)}")
         items: list[VoidParserItem] = []
-        for index, listing_url in enumerate(listing_urls, start=1):
-            notify(f"Парсинг {index}/{len(listing_urls)}")
-            try:
-                with self._session() as session:
-                    item = self._parse_listing(session, listing_url)
-                if item:
-                    items.append(item)
-            except Exception as exc:
-                notify(f"Ошибка {listing_url}: {exc}")
-            time.sleep(0.8)
+        session: BrowserSession | None = None
+
+        def ensure_session() -> BrowserSession:
+            nonlocal session
+            if session is None or not session.is_alive():
+                if session is not None:
+                    try:
+                        session.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                session = self._session()
+                session.__enter__()
+            return session
+
+        try:
+            for index, summary in enumerate(summaries, start=1):
+                notify(f"Парсинг {index}/{len(summaries)}")
+                item: VoidParserItem | None = None
+                try:
+                    item = self._parse_listing(ensure_session(), summary)
+                except Exception as exc:
+                    logger.warning("Listing parse failed for %s: %s", summary.url, exc)
+                    notify(f"Детали недоступны ({index}), беру из поиска")
+                    if session and not session.is_alive():
+                        session = None
+                if item is None:
+                    item = self._item_from_summary(summary)
+                items.append(item)
+                time.sleep(0.6)
+        finally:
+            if session is not None:
+                try:
+                    session.__exit__(None, None, None)
+                except Exception:
+                    pass
 
         return VoidParserResult(items=items)
 
-    def _collect_listing_urls(
+    def _item_from_summary(self, summary: SearchSummary) -> VoidParserItem:
+        parser_views = self._view_counts.get(summary.url, 0)
+        self._view_counts[summary.url] = parser_views + 1
+        return VoidParserItem(
+            item_title=str(summary.title or "").strip(),
+            item_photo=str(summary.image or ""),
+            item_price=format_price(summary.price),
+            item_link=summary.url,
+            item_person_name=str(summary.seller_name or ""),
+            parser_views=parser_views,
+        )
+
+    def _collect_listings(
         self,
         session: BrowserSession,
         start_url: str,
         notify: Callable[[str], None],
-    ) -> list[str]:
+    ) -> list[SearchSummary]:
         normalized = self._normalize_start_url(start_url)
         if LISTING_HREF_RE.search(urlparse(normalized).path):
-            return [normalized]
+            return [SearchSummary(url=normalized)]
 
-        collected: list[str] = []
+        collected: list[SearchSummary] = []
         seen: set[str] = set()
         js = SEARCH_SUMMARY_JS.replace("LOCALE", json.dumps(self.config.locale))
 
@@ -119,8 +165,8 @@ class RicardoParser:
                 break
             session.wait_for_next_data()
 
-            summaries = session.evaluate(js)
-            links: list[str] = []
+            page_summaries: list[SearchSummary] = []
+            summaries = session.evaluate(js) or []
             if summaries:
                 for item in summaries:
                     href = item.get("url")
@@ -129,27 +175,45 @@ class RicardoParser:
                     full = urljoin(self.base_url + "/", href)
                     if not full.endswith("/"):
                         full += "/"
-                    links.append(full)
+                    page_summaries.append(
+                        SearchSummary(
+                            url=full,
+                            title=str(item.get("title") or ""),
+                            price=item.get("price"),
+                            image=str(item.get("image") or ""),
+                        )
+                    )
             else:
                 next_data = extract_next_data(session)
-                links = [
-                    urljoin(self.base_url + "/", href)
-                    for href in extract_listing_urls_from_next_data(next_data, locale=self.config.locale)
-                ]
-                if not links:
-                    links = self._extract_listing_links(session)
+                for item in extract_search_summaries_from_next_data(
+                    next_data,
+                    locale=self.config.locale,
+                    base_url=self.base_url,
+                ):
+                    page_summaries.append(
+                        SearchSummary(
+                            url=item["url"],
+                            title=str(item.get("title") or ""),
+                            price=item.get("price"),
+                            image=str(item.get("image") or ""),
+                            seller_name=str(item.get("seller_name") or ""),
+                        )
+                    )
+                if not page_summaries:
+                    for link in self._extract_listing_links(session):
+                        page_summaries.append(SearchSummary(url=link))
 
-            if not links:
+            if not page_summaries:
                 title = session.evaluate("() => document.title || ''") or ""
                 notify(f"Объявления не найдены на странице. title={title!r}")
                 break
 
             new_count = 0
-            for link in links:
-                if link in seen:
+            for summary in page_summaries:
+                if summary.url in seen:
                     continue
-                seen.add(link)
-                collected.append(link)
+                seen.add(summary.url)
+                collected.append(summary)
                 new_count += 1
                 if len(collected) >= self.config.max_items:
                     return collected
@@ -175,7 +239,8 @@ class RicardoParser:
             links.append(full)
         return list(dict.fromkeys(links))
 
-    def _parse_listing(self, session: BrowserSession, listing_url: str) -> VoidParserItem | None:
+    def _parse_listing(self, session: BrowserSession, summary: SearchSummary) -> VoidParserItem | None:
+        listing_url = summary.url
         session.goto(listing_url)
         if not session.wait_for_next_data():
             raise RuntimeError("Не удалось получить __NEXT_DATA__")
@@ -186,18 +251,24 @@ class RicardoParser:
 
         seller = article.get("seller") or {}
         offer = article.get("offer") or {}
-        nickname = str(seller.get("nickname") or deep_get(product, "offers", "seller", "name") or "")
+        nickname = str(
+            seller.get("nickname")
+            or summary.seller_name
+            or deep_get(product, "offers", "seller", "name")
+            or ""
+        )
         seller_id = str(seller.get("id") or "")
 
         seller_stats = self._get_seller_stats(session, seller, nickname, seller_id)
 
-        title = article.get("title") or deep_get(product, "name") or ""
-        image = pick_image_url(article.get("images") or deep_get(product, "image"))
+        title = article.get("title") or deep_get(product, "name") or summary.title or ""
+        image = pick_image_url(article.get("images") or deep_get(product, "image")) or summary.image
         price_value = (
             offer.get("price")
             or deep_get(product, "offers", "price")
             or article.get("buyNowPrice")
             or article.get("buy_now_price")
+            or summary.price
         )
         created_raw = (
             article.get("creationDate")
@@ -288,7 +359,7 @@ class RicardoParser:
         needs_profile = seller_url and (
             not stats["ads_number_bought"] or not stats["ads_number_sold"] or not stats["registration_date"]
         )
-        if needs_profile:
+        if needs_profile and session.is_alive():
             try:
                 session.goto(seller_url)
                 session.wait_for_next_data()

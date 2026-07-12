@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from typing import Any
+from urllib.parse import urlparse
 
 from camoufox.sync_api import Camoufox
 from playwright.sync_api import Error as PlaywrightError
@@ -22,6 +23,29 @@ INTERSTITIAL_PREFIXES = (
     "attention required",
     "ricardo captcha",
 )
+
+BLOCKED_HOST_PARTS = (
+    "googletagmanager.com",
+    "google-analytics.com",
+    "hotjar.com",
+    "facebook.net",
+    "doubleclick.net",
+    "criteo.com",
+    "taboola.com",
+)
+
+ERROR_SWALLOW_INIT_SCRIPT = """
+() => {
+  const swallow = (event) => {
+    if (event && event.preventDefault) event.preventDefault();
+    if (event && event.stopImmediatePropagation) event.stopImmediatePropagation();
+    return true;
+  };
+  window.addEventListener('error', swallow, true);
+  window.addEventListener('unhandledrejection', swallow, true);
+  window.onerror = () => true;
+}
+"""
 
 
 class BrowserSession:
@@ -56,11 +80,37 @@ class BrowserSession:
         self._camoufox = Camoufox(**launch_kwargs)
         self.browser = self._camoufox.__enter__()
         self.page = self.browser.new_page()
-        self.page.set_default_timeout(45000)
-        self.page.on("pageerror", self._on_page_error)
-        self.page.on("crash", self._on_page_crash)
+        self._configure_page(self.page)
         self._load_cookies()
         return self
+
+    def _configure_page(self, page: Page) -> None:
+        page.set_default_timeout(45000)
+        page.add_init_script(ERROR_SWALLOW_INIT_SCRIPT)
+        page.on("pageerror", self._on_page_error)
+        page.on("crash", self._on_page_crash)
+        try:
+            page.context.on("pageerror", self._on_page_error)
+        except Exception:
+            pass
+        page.route("**/*", self._route_request)
+
+    @staticmethod
+    def _route_request(route: Any, request: Any) -> None:
+        host = urlparse(request.url).netloc.lower()
+        if any(part in host for part in BLOCKED_HOST_PARTS):
+            route.abort()
+        else:
+            route.continue_()
+
+    def is_alive(self) -> bool:
+        if not self.page:
+            return False
+        try:
+            self.page.evaluate("() => true")
+            return True
+        except Exception:
+            return False
 
     def _on_page_error(self, error: BaseException) -> None:
         # Ricardo sometimes throws JS errors; Playwright can crash while reporting them.
@@ -174,8 +224,11 @@ class BrowserSession:
             result = self.evaluate(script)
             if result:
                 return result
-            if attempt < attempts - 1:
-                self.page.wait_for_timeout(wait_ms)
+            if attempt < attempts - 1 and self.page:
+                try:
+                    self.page.wait_for_timeout(wait_ms)
+                except PlaywrightError:
+                    return None
         return None
 
     def wait_for_next_data(self, *, attempts: int = 8, wait_ms: int = 1500) -> bool:

@@ -101,6 +101,55 @@ def extract_phone(data: dict[str, Any]) -> str:
     return ""
 
 
+def extract_search_summaries_from_next_data(
+    next_data: dict[str, Any] | None,
+    *,
+    locale: str = "de",
+    base_url: str = "https://www.ricardo.ch/de",
+) -> list[dict[str, Any]]:
+    if not next_data:
+        return []
+
+    summaries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_item(item: dict[str, Any]) -> None:
+        href = item.get("url") or item.get("href") or item.get("permalink")
+        if not isinstance(href, str) or not LISTING_HREF_RE.search(href):
+            return
+        normalized = href.split("?")[0]
+        if not normalized.endswith("/"):
+            normalized += "/"
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        seller = item.get("seller") if isinstance(item.get("seller"), dict) else {}
+        summaries.append(
+            {
+                "url": normalized,
+                "title": str(item.get("title") or item.get("name") or ""),
+                "price": item.get("price") or item.get("buyNowPrice") or item.get("buy_now_price"),
+                "image": item.get("image") or item.get("thumbnailUrl") or "",
+                "seller_name": str(seller.get("nickname") or seller.get("name") or ""),
+            }
+        )
+
+    queries = deep_get(next_data, "props", "pageProps", "dehydratedState", "queries", default=[]) or []
+    for query in queries:
+        data = deep_get(query, "state", "data")
+        if not isinstance(data, dict):
+            continue
+        for key in ("listings", "articles", "items", "results", "searchResults", "regularResults"):
+            listings = data.get(key)
+            if not isinstance(listings, list):
+                continue
+            for item in listings:
+                if isinstance(item, dict):
+                    add_item(item)
+
+    return summaries
+
+
 def extract_listing_urls_from_next_data(
     next_data: dict[str, Any] | None,
     *,
