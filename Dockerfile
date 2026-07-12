@@ -5,6 +5,7 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV HEADLESS=true
+ENV XDG_CACHE_HOME=/app/.cache
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -38,8 +39,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN python pin_camoufox_browser.py
-
-RUN mkdir -p /app/data
+RUN mkdir -p /app/.cache /app/data \
+    && python pin_camoufox_browser.py --force \
+    && python -c "from camoufox.pkgman import launch_path; print('Camoufox:', launch_path())"
 
 CMD ["python", "-m", "bot.main"]

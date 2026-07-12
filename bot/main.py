@@ -10,6 +10,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BufferedInputFile, Message
 
+from pin_camoufox_browser import ensure_pinned_browser
 from config import Settings, get_settings
 from parser.models import VoidParserResult
 from parser.ricardo import ParserConfig, RicardoParser
@@ -178,6 +179,7 @@ async def main() -> None:
     global settings
     settings = get_settings()
     ensure_data_dir(settings.data_dir)
+    await asyncio.to_thread(ensure_pinned_browser)
     bot = Bot(token=settings.bot_token)
     dp = build_dispatcher()
     await dp.start_polling(bot)

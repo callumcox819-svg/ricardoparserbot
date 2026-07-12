@@ -1,90 +1,78 @@
 #!/usr/bin/env python3
-"""Install a known-good Camoufox build for ricardo.ch scraping."""
+"""Ensure Camoufox browser binaries are installed."""
 
 from __future__ import annotations
 
-import io
 import json
-import os
 import platform
-import shlex
+import subprocess
 import sys
-import zipfile
 from pathlib import Path
 
-import requests
 from platformdirs import user_cache_dir
 
 VERSION = "152.0.4"
 RELEASE = "zeta.1"
-ASSET_URLS = {
-    ("darwin", "arm64"): (
-        "https://github.com/daijro/camoufox/releases/download/v152.0.2-alpha/"
-        "camoufox-152.0.4-alpha.25-mac.arm64.zip"
-    ),
-    ("linux", "x86_64"): (
-        "https://github.com/daijro/camoufox/releases/download/v152.0.2-alpha/"
-        "camoufox-152.0.4-alpha.25-lin.x86_64.zip"
-    ),
-}
 
 
 def install_dir() -> Path:
     return Path(user_cache_dir("camoufox"))
 
 
-def is_pinned_build_installed() -> bool:
+def launch_binary_name() -> str:
+    if sys.platform == "darwin":
+        return "Camoufox.app"
+    if sys.platform == "win32":
+        return "camoufox.exe"
+    return "camoufox-bin"
+
+
+def launch_binary_path() -> Path:
+    base = install_dir()
+    name = launch_binary_name()
+    if sys.platform == "darwin":
+        return base / name
+    return base / name
+
+
+def is_browser_installed() -> bool:
+    path = launch_binary_path()
+    if not path.exists():
+        return False
     version_file = install_dir() / "version.json"
-    if version_file.exists():
-        try:
-            data = json.loads(version_file.read_text(encoding="utf-8"))
-            if data.get("version") == VERSION and data.get("release") == RELEASE:
-                if sys.platform == "darwin":
-                    return (install_dir() / "Camoufox.app").exists()
-                return any(install_dir().iterdir())
-        except json.JSONDecodeError:
-            pass
-    return any(install_dir().iterdir()) if install_dir().exists() else False
+    return version_file.exists()
 
 
-def install_pinned_build() -> None:
-    machine = platform.machine().lower()
-    if machine == "amd64":
-        machine = "x86_64"
-    key = (sys.platform, machine)
-    url = ASSET_URLS.get(key)
-    if not url:
-        import subprocess
+def run_camoufox_fetch() -> None:
+    print("Installing Camoufox via `python -m camoufox fetch`...")
+    subprocess.run([sys.executable, "-m", "camoufox", "fetch"], check=True)
 
-        print(f"No pinned asset for {key}, falling back to camoufox fetch")
-        subprocess.run([sys.executable, "-m", "camoufox", "fetch"], check=True)
-        return
 
-    target = install_dir()
-    print(f"Downloading Camoufox from {url}")
-    response = requests.get(url, timeout=180)
-    response.raise_for_status()
-
-    target.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-        archive.extractall(target)
-
-    if sys.platform != "win32":
-        os.system(f"chmod -R 755 {shlex.quote(str(target))}")  # nosec
-
-    (target / "version.json").write_text(
+def write_pinned_version_file() -> None:
+    (install_dir() / "version.json").write_text(
         json.dumps({"version": VERSION, "release": RELEASE}),
         encoding="utf-8",
     )
-    print(f"Pinned Camoufox to {VERSION}-{RELEASE}")
 
 
 def ensure_pinned_browser(force: bool = False) -> bool:
-    if not force and is_pinned_build_installed():
+    if not force and is_browser_installed():
+        print(f"Camoufox already installed at {install_dir()}")
         return False
-    install_pinned_build()
+
+    run_camoufox_fetch()
+
+    if not is_browser_installed():
+        raise RuntimeError(
+            f"Camoufox fetch finished, but binary not found at {launch_binary_path()}"
+        )
+
+    write_pinned_version_file()
+    print(f"Camoufox ready at {launch_binary_path()}")
     return True
 
 
 if __name__ == "__main__":
-    ensure_pinned_browser(force="--force" in sys.argv)
+  force = "--force" in sys.argv
+  ensure_pinned_browser(force=force)
+  print("platform", sys.platform, platform.machine(), "dir", install_dir())
